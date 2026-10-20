@@ -23,6 +23,15 @@ const (
 	StateReversed
 )
 
+// TransferHot hypothetical: two structures, one per cache line
+type TransferHot struct { // 32 bytes, line 0
+	DebitAmount  Money         //  8
+	CreditAmount Money         //  8
+	Sequence     uint64        //  8
+	State        TransferState //  1
+	_            [7]byte       //  7 → 32
+}
+
 // Transfer is an immutable fact recording a double-entry posting.
 //
 // Double-entry invariant: for every Transfer,
@@ -53,10 +62,8 @@ type Transfer struct {
 
 	State TransferState // offset 72, size  1
 
-	_ [7]byte // offset 73, padding to 80 (align next uint64)
+	_ [55]byte //  73..128
 
-	// 48 bytes of explicit tail padding to reach 128.
-	_ [48]byte // offset 80, size 48
 }
 
 // Compile-time assertions. These fail the build if the layout drifts.
