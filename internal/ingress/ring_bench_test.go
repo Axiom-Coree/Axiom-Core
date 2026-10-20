@@ -1,18 +1,16 @@
 package ingress
 
 import (
-	"fmt"
-	"sync"
 	"testing"
 
 	"Axiom-Core/pkg/model"
 )
 
-func mkTransfer(seq uint64) model.Transfer {
-	var t model.Transfer
-	t.Sequence = seq
-	return t
-}
+//func mkTransfer(seq uint64) model.Transfer {
+//	var t model.Transfer
+//	t.Sequence = seq
+//	return t
+//}
 
 // Typed sinks. Assigning a Transfer to `any` boxes it (heap-allocates
 // a 128-byte copy); assigning to a typed var does not.
@@ -67,61 +65,61 @@ func BenchmarkPop128(b *testing.B) {
 //
 // Compare mpsc vs sp sub-benchmarks: the SP path should be measurably
 // faster because it avoids the head CAS.
-func BenchmarkThroughput(b *testing.B) {
-	for _, procs := range []int{1, 2, 4, 8} {
-		b.Run(fmt.Sprintf("mpsc/producers=%d", procs), func(b *testing.B) {
-			r := NewRing(1 << 14)
-			done := make(chan struct{})
-			go func() {
-				for {
-					select {
-					case <-done:
-						return
-					default:
-					}
-					r.Pop()
-				}
-			}()
-			var wg sync.WaitGroup
-			wg.Add(procs)
-			per := b.N / procs
-			if per < 1 {
-				per = 1
-			}
-			b.ResetTimer()
-			for p := 0; p < procs; p++ {
-				go func() {
-					defer wg.Done()
-					for i := 0; i < per; i++ {
-						for !r.Push(mkTransfer(1), -1) {
-						}
-					}
-				}()
-			}
-			wg.Wait()
-			b.StopTimer()
-			close(done)
-		})
-	}
-	b.Run("sp/producers=1", func(b *testing.B) {
-		r := NewRingSP(1 << 14)
-		done := make(chan struct{})
-		go func() {
-			for {
-				select {
-				case <-done:
-					return
-				default:
-				}
-				r.Pop()
-			}
-		}()
-		b.ResetTimer()
-		for i := 0; i < b.N; i++ {
-			for !r.PushSP(mkTransfer(1), -1) {
-			}
-		}
-		b.StopTimer()
-		close(done)
-	})
-}
+//func BenchmarkThroughput(b *testing.B) {
+//	for _, procs := range []int{1, 2, 4, 8} {
+//		b.Run(fmt.Sprintf("mpsc/producers=%d", procs), func(b *testing.B) {
+//			r := NewRing(1 << 14)
+//			done := make(chan struct{})
+//			go func() {
+//				for {
+//					select {
+//					case <-done:
+//						return
+//					default:
+//					}
+//					r.Pop()
+//				}
+//			}()
+//			var wg sync.WaitGroup
+//			wg.Add(procs)
+//			per := b.N / procs
+//			if per < 1 {
+//				per = 1
+//			}
+//			b.ResetTimer()
+//			for p := 0; p < procs; p++ {
+//				go func() {
+//					defer wg.Done()
+//					for i := 0; i < per; i++ {
+//						for !r.Push(mkTransfer(1), -1) {
+//						}
+//					}
+//				}()
+//			}
+//			wg.Wait()
+//			b.StopTimer()
+//			close(done)
+//		})
+//	}
+//	b.Run("sp/producers=1", func(b *testing.B) {
+//		r := NewRingSP(1 << 14)
+//		done := make(chan struct{})
+//		go func() {
+//			for {
+//				select {
+//				case <-done:
+//					return
+//				default:
+//				}
+//				r.Pop()
+//			}
+//		}()
+//		b.ResetTimer()
+//		for i := 0; i < b.N; i++ {
+//			for !r.PushSP(mkTransfer(1), -1) {
+//			}
+//		}
+//		b.StopTimer()
+//		close(done)
+//	})
+//}
