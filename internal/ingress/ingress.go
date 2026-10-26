@@ -4,6 +4,7 @@ import (
 	"errors"
 	"runtime"
 	"sync/atomic"
+	"time"
 
 	"Axiom-Core/internal/executor"
 	"Axiom-Core/pkg/model"
@@ -34,24 +35,53 @@ var (
 // own ring, or wrap the Gateway in a mutex — but the latter defeats
 // the point of the SP ring.
 type Gateway struct {
-	index *executor.IdempotencyIndex
-	ring  *Ring
-	seq   atomic.Uint64 // logical transfer sequence, monotonic
+	index       *executor.IdempotencyIndex
+	ring        *Ring
+	seq         atomic.Uint64 // logical transfer sequence, monotonic
+	heap        *executor.TimeoutHeap
+	now         func() int64 // injectable clock for tests
+	timeoutNano int64        // deadline offset from submit time
 
 	// maxSpins bounds how long Submit will spin when the ring is
 	// full before returning ErrBackpressure. 64 matches the ring's
 	// internal backoff threshold; going beyond that means the ring
 	// really is saturated and the caller should back off.
 	maxSpins int
+	wakeup   chan<- struct{} // optional; nudges the Timer
+}
+
+// GatewayConfig bundles the wiring for NewGatewayWithTimeout.
+type GatewayConfig struct {
+	Index       *executor.IdempotencyIndex
+	Ring        *Ring
+	Heap        *executor.TimeoutHeap
+	TimeoutNano int64
+	Now         func() int64 // nil = time.Now().UnixNano
+	Wakeup      chan<- struct{}
 }
 
 // NewGateway wires an index and a ring into a boundary. The ring must
 // be constructed with NewRingSP, since Submit calls PushSP.
 func NewGateway(index *executor.IdempotencyIndex, ring *Ring) *Gateway {
+	return &Gateway{index: index, ring: ring, maxSpins: 64}
+}
+
+// NewGatewayWithTimeout is the Day-4 constructor: Submit pushes to the
+// heap after a successful ring push, so the transfer's timeout starts
+// ticking when it's enqueued.
+func NewGatewayWithTimeout(cfg GatewayConfig) *Gateway {
+	now := cfg.Now
+	if now == nil {
+		now = func() int64 { return time.Now().UnixNano() }
+	}
 	return &Gateway{
-		index:    index,
-		ring:     ring,
-		maxSpins: 64,
+		index:       cfg.Index,
+		ring:        cfg.Ring,
+		heap:        cfg.Heap,
+		now:         now,
+		timeoutNano: cfg.TimeoutNano,
+		maxSpins:    64,
+		wakeup:      cfg.Wakeup,
 	}
 }
 
@@ -110,7 +140,20 @@ func (g *Gateway) Submit(t model.Transfer) (uint64, error) {
 		// transfer wasn't enqueued. The caller sees ErrBackpressure
 		// and should not retry the same ID (it's recorded) — it
 		// should surface the failure. This is documented at-most-once.
+
 		return seq, ErrBackpressure
+	}
+
+	// register a timeout. Only after the ring accepted the
+	// transfer, so a backpressure-rejected transfer has no timeout.
+	if g.heap != nil {
+		g.heap.Push(t.ID, g.now()+g.timeoutNano)
+		if g.wakeup != nil {
+			select {
+			case g.wakeup <- struct{}{}:
+			default:
+			}
+		}
 	}
 
 	return seq, nil
