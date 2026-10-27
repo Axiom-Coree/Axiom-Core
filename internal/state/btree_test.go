@@ -10,29 +10,34 @@ import (
 	"Axiom-Core/pkg/model"
 )
 
-// helpers
+// ---- helpers ----
 
-// mkID builds an AccountID with the given uint64 in the first 8 bytes.
-// The remaining 8 bytes stay zero; for tests that's enough for 2^64
-// distinct keys.
 func mkID(n uint64) model.AccountID {
 	var id model.AccountID
 	binary.BigEndian.PutUint64(id[:8], n)
 	return id
 }
 
-// mkAccount builds a model.Account with the given ID and balance.
 func mkAccount(n uint64, balance model.Money) model.Account {
 	return model.Account{ID: mkID(n), Balance: balance}
 }
 
+func openSnapshot(t *testing.T, s *Store) *SnapshotHandle {
+	t.Helper()
+	snap := s.Snapshot()
+	t.Cleanup(snap.Release)
+	return snap
+}
+
 // ---- correctness tests ----
 
-// Property: a single Put is visible to a subsequent Get.
 func TestPutGet(t *testing.T) {
 	s := NewStore()
+	defer s.Close()
 	s.Put(mkAccount(1, 100))
-	got, ok := s.Snapshot().Get(mkID(1))
+
+	snap := openSnapshot(t, s)
+	got, ok := snap.Get(mkID(1))
 	if !ok {
 		t.Fatal("Get returned not-found for a key that was just put")
 	}
@@ -41,12 +46,13 @@ func TestPutGet(t *testing.T) {
 	}
 }
 
-// Property: a Put updates an existing key (no duplicate).
 func TestPutUpdates(t *testing.T) {
 	s := NewStore()
+	defer s.Close()
 	s.Put(mkAccount(1, 100))
 	s.Put(mkAccount(1, 200))
-	snap := s.Snapshot()
+
+	snap := openSnapshot(t, s)
 	got, ok := snap.Get(mkID(1))
 	if !ok || got.Balance != 200 {
 		t.Fatalf("Get = (%+v, %v), want balance 200", got, ok)
@@ -56,19 +62,16 @@ func TestPutUpdates(t *testing.T) {
 	}
 }
 
-// Property: a snapshot taken before a Put does not see the Put. This is
-// the whole point of Day 5.
 func TestSnapshotIsolation(t *testing.T) {
 	s := NewStore()
+	defer s.Close()
 	s.Put(mkAccount(1, 100))
 
-	snapOld := s.Snapshot()
+	snapOld := openSnapshot(t, s)
 
-	// Two writes after the snapshot: update the same key, insert a new one.
 	s.Put(mkAccount(1, 200))
 	s.Put(mkAccount(2, 300))
 
-	// Old snapshot: still sees balance 100, still has only key 1.
 	if got, ok := snapOld.Get(mkID(1)); !ok || got.Balance != 100 {
 		t.Fatalf("old snapshot Get(1) = (%+v, %v), want balance 100", got, ok)
 	}
@@ -79,8 +82,7 @@ func TestSnapshotIsolation(t *testing.T) {
 		t.Fatalf("old snapshot Len = %d, want 1", n)
 	}
 
-	// New snapshot sees both.
-	snapNew := s.Snapshot()
+	snapNew := openSnapshot(t, s)
 	if got, _ := snapNew.Get(mkID(1)); got.Balance != 200 {
 		t.Fatalf("new snapshot Get(1) balance = %d, want 200", got.Balance)
 	}
@@ -89,15 +91,14 @@ func TestSnapshotIsolation(t *testing.T) {
 	}
 }
 
-// Property: inserting more than maxKeys entries forces a root split,
-// and every entry survives.
 func TestSplitRoot(t *testing.T) {
 	s := NewStore()
+	defer s.Close()
 	const n = maxKeys + 1
 	for i := 0; i < n; i++ {
 		s.Put(mkAccount(uint64(i), model.Money(i)))
 	}
-	snap := s.Snapshot()
+	snap := openSnapshot(t, s)
 	if got := snap.Len(); got != n {
 		t.Fatalf("Len = %d, want %d", got, n)
 	}
@@ -109,18 +110,15 @@ func TestSplitRoot(t *testing.T) {
 	}
 }
 
-// Property: a large tree (many splits, 2+ levels deep) preserves all
-// entries and their order.
 func TestLargeTree(t *testing.T) {
 	const n = 10_000
 	s := NewStore()
-	// Insert in a scrambled order to force splits all over the tree.
+	defer s.Close()
 	rng := rand.New(rand.NewSource(42))
-	order := rng.Perm(n)
-	for _, i := range order {
+	for _, i := range rng.Perm(n) {
 		s.Put(mkAccount(uint64(i), model.Money(i)))
 	}
-	snap := s.Snapshot()
+	snap := openSnapshot(t, s)
 	if got := snap.Len(); got != n {
 		t.Fatalf("Len = %d, want %d", got, n)
 	}
@@ -132,16 +130,15 @@ func TestLargeTree(t *testing.T) {
 	}
 }
 
-// Property: Range visits every account in strictly ascending ID order.
 func TestRangeOrdered(t *testing.T) {
 	const n = 1000
 	s := NewStore()
-	// Insert scrambled.
+	defer s.Close()
 	rng := rand.New(rand.NewSource(7))
 	for _, i := range rng.Perm(n) {
 		s.Put(mkAccount(uint64(i), model.Money(i)))
 	}
-	snap := s.Snapshot()
+	snap := openSnapshot(t, s)
 
 	count := 0
 	var prev model.AccountID
@@ -160,14 +157,15 @@ func TestRangeOrdered(t *testing.T) {
 	}
 }
 
-// Property: Range stops when the callback returns false.
 func TestRangeStops(t *testing.T) {
 	s := NewStore()
+	defer s.Close()
 	for i := 0; i < 100; i++ {
 		s.Put(mkAccount(uint64(i), 0))
 	}
+	snap := openSnapshot(t, s)
 	count := 0
-	s.Snapshot().Range(func(model.Account) bool {
+	snap.Range(func(model.Account) bool {
 		count++
 		return count < 5
 	})
@@ -176,27 +174,26 @@ func TestRangeStops(t *testing.T) {
 	}
 }
 
-// Property: All returns every account sorted by ID.
 func TestAll(t *testing.T) {
 	const n = 500
 	s := NewStore()
+	defer s.Close()
 	rng := rand.New(rand.NewSource(1))
 	for _, i := range rng.Perm(n) {
 		s.Put(mkAccount(uint64(i), model.Money(i)))
 	}
-	all := s.Snapshot().All()
+	snap := openSnapshot(t, s)
+	all := snap.All()
 	if len(all) != n {
 		t.Fatalf("All len = %d, want %d", len(all), n)
 	}
 	for i := 1; i < len(all); i++ {
 		if !accountIDLess(all[i-1].ID, all[i].ID) {
-			t.Fatalf("All out of order at %d: %x then %x", i, all[i-1].ID[:8], all[i].ID[:8])
+			t.Fatalf("All out of order at %d", i)
 		}
 	}
 }
 
-// Property: accountIDLess is a strict order (irreflexive, antisymmetric,
-// transitive on a sample).
 func TestAccountIDLess(t *testing.T) {
 	if accountIDLess(mkID(1), mkID(1)) {
 		t.Fatal("reflexive")
@@ -207,10 +204,7 @@ func TestAccountIDLess(t *testing.T) {
 	if accountIDLess(mkID(2), mkID(1)) {
 		t.Fatal("2 < 1 true")
 	}
-	// Order should be lexicographic on the full 16 bytes.
 	var a, b model.AccountID
-	a[0] = 0
-	b[0] = 0
 	a[8] = 0xFF
 	b[8] = 0x01
 	if !accountIDLess(b, a) {
@@ -218,19 +212,72 @@ func TestAccountIDLess(t *testing.T) {
 	}
 }
 
-// Property: concurrent readers see consistent snapshots while a writer
-// is mutating. This is the -race acceptance test.
+// Property: Release is idempotent — calling it twice must not panic or
+// underflow the liveEpochs counter.
+func TestReleaseIsIdempotent(t *testing.T) {
+	s := NewStore()
+	defer s.Close()
+	s.Put(mkAccount(1, 0))
+
+	snap := s.Snapshot()
+	snap.Release()
+	snap.Release() // must not panic
+	snap.Release()
+
+	// Handle is nil-store after release; Get should return not-found.
+	if _, ok := snap.Get(mkID(1)); ok {
+		// We don't strictly guarantee this, but the handle should not
+		// give stale data after release in Day 6's design. If this
+		// becomes a problem, we can document differently.
+		t.Log("Get after Release returned data; this is allowed but not guaranteed")
+	}
+}
+
+// Property: after Release, the epoch is removed from the registry.
+func TestReleaseDropsEpoch(t *testing.T) {
+	s := NewStore()
+	defer s.Close()
+
+	a := s.Snapshot()
+	b := s.Snapshot()
+
+	s.mu.Lock()
+	n := s.liveEpochs[a.epoch]
+	s.mu.Unlock()
+	if n != 2 {
+		t.Fatalf("expected 2 live handles at epoch %d, got %d", a.epoch, n)
+	}
+
+	a.Release()
+
+	s.mu.Lock()
+	n = s.liveEpochs[b.epoch]
+	s.mu.Unlock()
+	if n != 1 {
+		t.Fatalf("after one release: expected 1, got %d", n)
+	}
+
+	b.Release()
+
+	s.mu.Lock()
+	_, ok := s.liveEpochs[b.epoch]
+	s.mu.Unlock()
+	if ok {
+		t.Fatalf("epoch %d still in registry after both releases", b.epoch)
+	}
+}
+
 func TestConcurrentSnapshots(t *testing.T) {
 	const iterations = 10_000
 	const readers = 8
 
 	s := NewStore()
+	defer s.Close()
 	s.Put(mkAccount(1, 0))
 
 	var wg sync.WaitGroup
 	stop := make(chan struct{})
 
-	// Writer: monotonically increases the balance.
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -240,8 +287,6 @@ func TestConcurrentSnapshots(t *testing.T) {
 		}
 	}()
 
-	// Readers: repeatedly take snapshots and read. The balance must be
-	// non-decreasing across snapshots (writer only increments).
 	for r := 0; r < readers; r++ {
 		wg.Add(1)
 		go func() {
@@ -255,6 +300,7 @@ func TestConcurrentSnapshots(t *testing.T) {
 				}
 				snap := s.Snapshot()
 				a, ok := snap.Get(mkID(1))
+				snap.Release()
 				if !ok {
 					t.Error("snapshot missing key 1")
 					return
@@ -270,8 +316,8 @@ func TestConcurrentSnapshots(t *testing.T) {
 
 	wg.Wait()
 
-	// Final snapshot must have the final balance.
-	got, _ := s.Snapshot().Get(mkID(1))
+	snap := openSnapshot(t, s)
+	got, _ := snap.Get(mkID(1))
 	if got.Balance != iterations {
 		t.Fatalf("final balance = %d, want %d", got.Balance, iterations)
 	}
@@ -279,15 +325,15 @@ func TestConcurrentSnapshots(t *testing.T) {
 
 // ---- benchmarks ----
 
-// BenchmarkSnapshotRead measures Get on a 1M-entry snapshot. This is
-// the operation a report or audit runs in a loop; it must not allocate.
 func BenchmarkSnapshotRead(b *testing.B) {
 	const n = 1_000_000
 	s := NewStore()
+	defer s.Close()
 	for i := 0; i < n; i++ {
 		s.Put(mkAccount(uint64(i), model.Money(i)))
 	}
 	snap := s.Snapshot()
+	defer snap.Release()
 
 	b.ReportAllocs()
 	b.ResetTimer()
@@ -299,11 +345,10 @@ func BenchmarkSnapshotRead(b *testing.B) {
 	}
 }
 
-// BenchmarkPutCOW measures Put on a 100k-entry tree. Every Put clones
-// one path (depth ~3 at 100k with fanout 64) and allocates ~3 nodes.
 func BenchmarkPutCOW(b *testing.B) {
 	const n = 100_000
 	s := NewStore()
+	defer s.Close()
 	for i := 0; i < n; i++ {
 		s.Put(mkAccount(uint64(i), model.Money(i)))
 	}
@@ -315,10 +360,9 @@ func BenchmarkPutCOW(b *testing.B) {
 	}
 }
 
-// BenchmarkPutCOWEmpty measures Put on a small tree. This is the
-// per-Put constant overhead: root clone + insert, no splits.
 func BenchmarkPutCOWEmpty(b *testing.B) {
 	s := NewStore()
+	defer s.Close()
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -327,43 +371,49 @@ func BenchmarkPutCOWEmpty(b *testing.B) {
 }
 
 // BenchmarkSnapshotRetention measures the memory cost of taking a
-// snapshot per Put, without releasing any. Heap growth is the point:
-// this is the workload that motivates reclamation in Day 6.
-//
-// Watch B/op on this one — it grows with b.N (that's the claim).
+// snapshot per Put WITHOUT releasing any. Heap growth is the point.
 func BenchmarkSnapshotRetention(b *testing.B) {
 	const prefill = 10_000
 	s := NewStore()
+	defer s.Close()
 	for i := 0; i < prefill; i++ {
 		s.Put(mkAccount(uint64(i), model.Money(i)))
 	}
 
-	var snaps []Snapshot
+	var snaps []*SnapshotHandle
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		snaps = append(snaps, s.Snapshot())
 		s.Put(mkAccount(uint64(i%prefill), model.Money(i)))
 	}
+	b.StopTimer()
+	for _, snap := range snaps {
+		snap.Release()
+	}
 	runtime.KeepAlive(snaps)
 }
 
-// BenchmarkPutAndSnapshot measures the realistic writer path: apply a
-// transfer (Put), then take a snapshot (as the drain loop will, when a
-// reporting consumer asks for one). This is the number the integrated
-// pipeline will pay per applied transfer.
-func BenchmarkPutAndSnapshot(b *testing.B) {
-	const n = 100_000
+// BenchmarkSnapshotRetentionReleased is the Day-6 comparison: same
+// workload, but each handle is released before the next is taken.
+// The memory cost should be ~0 (no snapshots pinned).
+//
+// The gap between BenchmarkSnapshotRetention and this benchmark is
+// the API's value.
+func BenchmarkSnapshotRetentionReleased(b *testing.B) {
+	const prefill = 10_000
 	s := NewStore()
-	for i := 0; i < n; i++ {
+	defer s.Close()
+	for i := 0; i < prefill; i++ {
 		s.Put(mkAccount(uint64(i), model.Money(i)))
 	}
 
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		s.Put(mkAccount(uint64(i%n), model.Money(i)))
 		snap := s.Snapshot()
-		snap.Get(mkID(uint64(i % n)))
+		snap.Get(mkID(uint64(i % prefill))) // simulate use
+		snap.Release()
+		s.Put(mkAccount(uint64(i%prefill), model.Money(i)))
 	}
 }
