@@ -219,6 +219,29 @@ func splitChild(parent *node, i int, c *node) {
 	parent.children = slices.Insert(parent.children, i+1, right)
 }
 
+func rangeWalk(n *node, fn func(model.Account) bool) bool {
+	if n == nil {
+		return true
+	}
+	if n.isLeaf() {
+		for _, a := range n.values {
+			if !fn(a) {
+				return false
+			}
+		}
+		return true
+	}
+	for i := range n.keys {
+		if !rangeWalk(n.children[i], fn) {
+			return false
+		}
+		if !fn(n.values[i]) {
+			return false
+		}
+	}
+	return rangeWalk(n.children[len(n.keys)], fn)
+}
+
 // delete is deliberately not implemented in Day 5. Deletion from a COW
 // B-tree requires rebalancing that touches siblings, which multiplies
 // the number of nodes cloned per delete. It is not needed for a
