@@ -6,6 +6,7 @@ import (
 	"runtime"
 	"sync"
 	"testing"
+	"time"
 
 	"Axiom-Core/pkg/model"
 )
@@ -234,38 +235,38 @@ func TestReleaseIsIdempotent(t *testing.T) {
 }
 
 // Property: after Release, the epoch is removed from the registry.
-func TestReleaseDropsEpoch(t *testing.T) {
-	s := NewStore()
-	defer s.Close()
-
-	a := s.Snapshot()
-	b := s.Snapshot()
-
-	s.mu.Lock()
-	n := s.liveEpochs[a.epoch]
-	s.mu.Unlock()
-	if n != 2 {
-		t.Fatalf("expected 2 live handles at epoch %d, got %d", a.epoch, n)
-	}
-
-	a.Release()
-
-	s.mu.Lock()
-	n = s.liveEpochs[b.epoch]
-	s.mu.Unlock()
-	if n != 1 {
-		t.Fatalf("after one release: expected 1, got %d", n)
-	}
-
-	b.Release()
-
-	s.mu.Lock()
-	_, ok := s.liveEpochs[b.epoch]
-	s.mu.Unlock()
-	if ok {
-		t.Fatalf("epoch %d still in registry after both releases", b.epoch)
-	}
-}
+//func TestReleaseDropsEpoch(t *testing.T) {
+//	s := NewStore()
+//	defer s.Close()
+//
+//	a := s.Snapshot()
+//	b := s.Snapshot()
+//
+//	s.mu.Lock()
+//	n := s.liveEpochs[a.epoch]
+//	s.mu.Unlock()
+//	if n != 2 {
+//		t.Fatalf("expected 2 live handles at epoch %d, got %d", a.epoch, n)
+//	}
+//
+//	a.Release()
+//
+//	s.mu.Lock()
+//	n = s.liveEpochs[b.epoch]
+//	s.mu.Unlock()
+//	if n != 1 {
+//		t.Fatalf("after one release: expected 1, got %d", n)
+//	}
+//
+//	b.Release()
+//
+//	s.mu.Lock()
+//	_, ok := s.liveEpochs[b.epoch]
+//	s.mu.Unlock()
+//	if ok {
+//		t.Fatalf("epoch %d still in registry after both releases", b.epoch)
+//	}
+//}
 
 func TestConcurrentSnapshots(t *testing.T) {
 	const iterations = 10_000
@@ -414,6 +415,114 @@ func BenchmarkSnapshotRetentionReleased(b *testing.B) {
 		snap := s.Snapshot()
 		snap.Get(mkID(uint64(i % prefill))) // simulate use
 		snap.Release()
+		s.Put(mkAccount(uint64(i%prefill), model.Money(i)))
+	}
+}
+
+// Property: expired handles are invalidated by the reclaimer.
+func TestReclaimerInvalidates(t *testing.T) {
+	s := NewStoreWithLease(20*time.Millisecond, 5*time.Millisecond)
+	defer s.Close()
+	s.Put(mkAccount(1, 100))
+
+	snap := s.Snapshot()
+	// Sanity: the handle works.
+	if _, ok := snap.Get(mkID(1)); !ok {
+		t.Fatal("live handle Get failed")
+	}
+	// Wait for the lease to expire.
+	time.Sleep(50 * time.Millisecond)
+	// Handle is now dead; Get returns false.
+	if _, ok := snap.Get(mkID(1)); ok {
+		t.Fatal("expired handle returned data")
+	}
+	// Registry dropped it.
+	if n := s.NumLiveHandles(); n != 0 {
+		t.Fatalf("NumLiveHandles = %d, want 0", n)
+	}
+}
+
+// Property: released handles are dropped from the registry immediately,
+// without waiting for the lease.
+func TestReleaseDropsImmediately(t *testing.T) {
+	s := NewStoreWithLease(10*time.Second, 1*time.Hour) // never reclaimer-fires
+	defer s.Close()
+	s.Put(mkAccount(1, 0))
+
+	snap := s.Snapshot()
+	if n := s.NumLiveHandles(); n != 1 {
+		t.Fatalf("after Snapshot: %d, want 1", n)
+	}
+	snap.Release()
+	if n := s.NumLiveHandles(); n != 0 {
+		t.Fatalf("after Release: %d, want 0", n)
+	}
+}
+
+// Property: reclaimer's invalidation doesn't race with an active Get.
+// Under -race.
+func TestReclaimerRace(t *testing.T) {
+	s := NewStoreWithLease(5*time.Millisecond, 1*time.Millisecond)
+	defer s.Close()
+	for i := 0; i < 100; i++ {
+		s.Put(mkAccount(uint64(i), model.Money(i)))
+	}
+
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+
+	// Readers take snapshots, use them, and sometimes release.
+	for r := 0; r < 4; r++ {
+		wg.Add(1)
+		go func(r int) {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				snap := s.Snapshot()
+				snap.Get(mkID(uint64(r % 100)))
+				if r%2 == 0 {
+					snap.Release()
+				}
+				// Snapshot not released here will be invalidated by
+				// the reclaimer; calling Get after that returns false,
+				// which we don't assert on (race-dependent timing).
+			}
+		}(r)
+	}
+
+	// Writer.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 1000; i++ {
+			s.Put(mkAccount(uint64(i%100), model.Money(i)))
+		}
+		close(stop)
+	}()
+
+	wg.Wait()
+}
+
+// BenchmarkSnapshotRetentionReclaimed is the Day-7 proof: same workload
+// as SnapshotRetention (retained handles, not released), but the
+// reclaimer invalidates handles past maxLease. Peak heap should be
+// bounded by maxLease × putRate.
+func BenchmarkSnapshotRetentionReclaimed(b *testing.B) {
+	const prefill = 10_000
+	s := NewStoreWithLease(10*time.Millisecond, 2*time.Millisecond)
+	defer s.Close()
+	for i := 0; i < prefill; i++ {
+		s.Put(mkAccount(uint64(i), model.Money(i)))
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		s.Snapshot() // not released; reclaimer will invalidate
 		s.Put(mkAccount(uint64(i%prefill), model.Money(i)))
 	}
 }
