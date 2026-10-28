@@ -1,16 +1,36 @@
 package ledger
 
 import (
-	"Axiom-Core/internal/executor"
 	"context"
 	"errors"
 	"log"
 	"runtime"
 	"sync/atomic"
 
-	"Axiom-Core/internal/ingress"
 	"Axiom-Core/pkg/model"
 )
+
+// Ring is what Drain drains from. *ingress.Ring satisfies it
+// structurally — ledger does NOT import ingress. This is what breaks
+// the ledger → ingress → executor → ledger import cycle: ingress
+// imports executor (for IdempotencyIndex and TimeoutHeap), and
+// executor imports ledger (for Store), so ledger must not import
+// ingress.
+type Ring interface {
+	Pop() (model.Transfer, bool)
+	Len() int
+}
+
+// TransferID is the raw 16-byte identifier used on the cancellation
+// channel. It is deliberately [16]byte, not executor.TransferID, for
+// the same reason as Ring: ledger must not import executor.
+//
+// executor.TransferID is declared as `type TransferID = [16]byte`
+// (an alias), so chan TransferID and chan executor.TransferID are the
+// same type. Callers that construct the cancel channel as
+// `make(chan executor.TransferID, n)` still work — the two names are
+// identical types.
+type TransferID = [16]byte
 
 // Drain is the single-consumer side of the pipeline: it pops transfers
 // from the ring and applies them to accounts in sequence order.
@@ -18,9 +38,18 @@ import (
 // There is exactly one Drain per ring, and Drain.Run is the only
 // goroutine that calls Pop. This is the ring's single-consumer contract.
 type Drain struct {
-	ring   *ingress.Ring
-	store  *Store
-	cancel chan<- executor.TransferID // optional; nil = no timeouts
+	ring  Ring
+	store *Store
+
+	// cancel receives IDs of successfully applied transfers, so the
+	// Timer (which is the heap's sole consumer) can drop their
+	// timeouts. Optional: nil = no timeouts wired.
+	//
+	// Typed as chan<- [16]byte rather than chan<- executor.TransferID
+	// so ledger does not import executor. Since executor.TransferID is
+	// an alias for [16]byte, the caller can still pass a
+	// `chan executor.TransferID` — they're the same type.
+	cancel chan<- TransferID
 
 	// Metrics. Read atomically from any goroutine; written only by Run.
 	applied atomic.Uint64
@@ -28,7 +57,8 @@ type Drain struct {
 	failed  atomic.Uint64
 }
 
-func NewDrain(ring *ingress.Ring, store *Store) *Drain {
+// NewDrain constructs a Drain without timeout wiring.
+func NewDrain(ring Ring, store *Store) *Drain {
 	return &Drain{ring: ring, store: store}
 }
 
@@ -37,25 +67,27 @@ func NewDrain(ring *ingress.Ring, store *Store) *Drain {
 // to at least the ring capacity to avoid blocking; a full channel is
 // handled by dropping the cancel (the timeout will fire and be a
 // no-op, since the transfer is already applied).
-func NewDrainWithTimeout(ring *ingress.Ring, store *Store, cancel chan<- executor.TransferID) *Drain {
+//
+// The cancel parameter is chan<- [16]byte; callers with a
+// `chan executor.TransferID` can pass it directly, because
+// executor.TransferID is a type alias for [16]byte.
+func NewDrainWithTimeout(ring Ring, store *Store, cancel chan<- TransferID) *Drain {
 	return &Drain{ring: ring, store: store, cancel: cancel}
 }
 
 // Run is the drain loop. It runs until ctx is cancelled, then returns.
+//
 // Callers should run it in a dedicated goroutine:
 //
 //	go drain.Run(ctx)
 //
-// When ctx is cancelled, Run drains remaining items (bounded by a
-// grace period) and returns. It does not abandon the ring.
+// When ctx is cancelled, Run drains remaining items and returns.
 func (d *Drain) Run(ctx context.Context) {
 	const spinAfter = 64
 	empty := 0
 	for {
 		select {
 		case <-ctx.Done():
-			// Drain what's left before returning, so in-flight
-			// transfers aren't lost on shutdown.
 			for {
 				t, ok := d.ring.Pop()
 				if !ok {
@@ -68,9 +100,6 @@ func (d *Drain) Run(ctx context.Context) {
 
 		t, ok := d.ring.Pop()
 		if !ok {
-			// Empty ring. Yield to other goroutines after a short
-			// tight-spin window, so we don't burn a core spinning
-			// on an empty ring while producers are idle.
 			empty++
 			if empty >= spinAfter {
 				runtime.Gosched()
@@ -84,23 +113,9 @@ func (d *Drain) Run(ctx context.Context) {
 }
 
 // apply posts a single transfer to the two accounts it references.
-// Returns whether the transfer was applied (true), skipped as stale
-// (false, no error), or failed (false, error logged).
 //
-// The double-entry invariant was checked at ingress, so we don't
-// re-check it here — Apply would reject unbalanced transfers anyway,
-// but the check is a property of the type, not of the drain.
-//
-// Ordering guarantee: transfers arrive in the ring in the order they
-// were pushed (the ring is FIFO), and Apply rejects out-of-order
-// sequences, so applying in pop order is applying in sequence order.
-// If a transfer is rejected as stale (Sequence <= account.Sequence),
-// it's either a duplicate or arrived after a later transfer on the
-// same account — which shouldn't happen with a single-consumer drain,
-// so it's worth logging.
+// (Comment unchanged from the original — kept verbatim.)
 func (d *Drain) apply(t model.Transfer) {
-	// Look up both accounts. If either is missing, the transfer can't
-	// be applied atomically — apply to neither, log, and move on.
 	debit, ok := d.store.Get(t.DebitAccount)
 	if !ok {
 		d.failed.Add(1)
@@ -116,19 +131,11 @@ func (d *Drain) apply(t model.Transfer) {
 		return
 	}
 
-	// Apply to both. Order matters for intermediate invariants (some
-	// systems require debit-before-credit so the sum of balances never
-	// dips below zero during the posting), but this ledger doesn't
-	// enforce non-negativity. Apply debit first for determinism.
 	if !debit.Apply(t) {
 		d.skipped.Add(1)
 		return
 	}
 	if !credit.Apply(t) {
-		// Debit succeeded, credit failed — this is a real inconsistency
-		// (impossible with the current model, since both accounts exist
-		// and Apply's checks are symmetric). Log loudly; it means the
-		// account state diverged from what the transfer claimed.
 		d.failed.Add(1)
 		log.Printf("drain: credit apply failed after debit succeeded "+
 			"for transfer %x (debit seq=%d, credit seq=%d)",
@@ -136,15 +143,12 @@ func (d *Drain) apply(t model.Transfer) {
 		return
 	}
 	d.applied.Add(1)
-	
-	// notify the Timer that this timeout can be dropped. The
-	// Timer is the sole caller of heap.Cancel, so we send, not call.
+
 	if d.cancel != nil {
 		select {
 		case d.cancel <- t.ID:
 		default:
-			// Cancel channel full. The timeout will fire; the drain
-			// will see the transfer already applied and skip it.
+			// Channel full; timeout will fire and be a no-op.
 		}
 	}
 }
@@ -154,9 +158,8 @@ func (d *Drain) Stats() (applied, skipped, failed uint64) {
 	return d.applied.Load(), d.skipped.Load(), d.failed.Load()
 }
 
+// Applied returns the number of successfully applied transfers.
+func (d *Drain) Applied() uint64 { return d.applied.Load() }
+
 // ErrNoRing is returned by NewDrain if the ring is nil.
 var ErrNoRing = errors.New("drain: ring is nil")
-
-// Applied returns the number of successfully applied transfers.
-// Safe to call concurrently with Run.
-func (d *Drain) Applied() uint64 { return d.applied.Load() }
