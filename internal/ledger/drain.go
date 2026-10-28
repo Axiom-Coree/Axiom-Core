@@ -1,6 +1,7 @@
 package ledger
 
 import (
+	"Axiom-Core/internal/executor"
 	"context"
 	"errors"
 	"log"
@@ -17,8 +18,9 @@ import (
 // There is exactly one Drain per ring, and Drain.Run is the only
 // goroutine that calls Pop. This is the ring's single-consumer contract.
 type Drain struct {
-	ring  *ingress.Ring
-	store *Store
+	ring   *ingress.Ring
+	store  *Store
+	cancel chan<- executor.TransferID // optional; nil = no timeouts
 
 	// Metrics. Read atomically from any goroutine; written only by Run.
 	applied atomic.Uint64
@@ -28,6 +30,15 @@ type Drain struct {
 
 func NewDrain(ring *ingress.Ring, store *Store) *Drain {
 	return &Drain{ring: ring, store: store}
+}
+
+// NewDrainWithTimeout wires a cancellation channel so successful
+// applies are reported to the Timer. The channel should be buffered
+// to at least the ring capacity to avoid blocking; a full channel is
+// handled by dropping the cancel (the timeout will fire and be a
+// no-op, since the transfer is already applied).
+func NewDrainWithTimeout(ring *ingress.Ring, store *Store, cancel chan<- executor.TransferID) *Drain {
+	return &Drain{ring: ring, store: store, cancel: cancel}
 }
 
 // Run is the drain loop. It runs until ctx is cancelled, then returns.
@@ -125,6 +136,17 @@ func (d *Drain) apply(t model.Transfer) {
 		return
 	}
 	d.applied.Add(1)
+	
+	// notify the Timer that this timeout can be dropped. The
+	// Timer is the sole caller of heap.Cancel, so we send, not call.
+	if d.cancel != nil {
+		select {
+		case d.cancel <- t.ID:
+		default:
+			// Cancel channel full. The timeout will fire; the drain
+			// will see the transfer already applied and skip it.
+		}
+	}
 }
 
 // Stats returns a snapshot of drain counters. Safe to call concurrently.
